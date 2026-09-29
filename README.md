@@ -111,6 +111,7 @@ Observed while running the pipeline locally:
 - `top_k` always returns results, even loosely related ones, so fallback rarely triggers with a seeded store. A distance threshold would let unrelated questions fall back safely.
 - The model doesn't always use every relevant chunk; in one run it answered from the Triage section and skipped the higher-ranked Mitigation section.
 - Answers sometimes reference internal labels like "Context 1." Prompting the model to cite Source IDs would make them clearer.
+- The model sometimes referenced internal labels like "Context 1" and skipped relevant chunks. The prompt now asks it to combine all relevant contexts and cite Source IDs, which improved answers in local testing.
 
 ## Setup
 
