@@ -1,342 +1,171 @@
 # Lab: Refactor a Flask RAG API with LangChain
 
+**Completed Sept 29, 2026**
+
 ## Overview
 
-You will refactor a Flask RAG API so the AI workflow is organized with LangChain components while preserving strong RAG behavior. Your endpoint should validate a question, retrieve approved runbook context, build a grounded prompt, call the model through a LangChain-supported workflow, return answer and source metadata, and handle missing context safely.
+A Flask API that answers engineers' incident questions using **Retrieval-Augmented Generation (RAG)**, organized with **LangChain** components. It retrieves relevant runbook chunks from a Chroma vector store, asks a local Ollama model to answer using only that approved context, and returns the answer with its sources and LangChain debug metadata.
 
-This lab is graded by automated tests. Passing the test suite is the required evidence that your implementation meets the expected behavior.
+![Screenshot of the completed LangChain RAG API lab](backend-langchain-rag-lab.png)
 
-## Scenario
+## How It Works
 
-You are a junior backend developer on an internal platform team. The reliability team has approved runbooks for common incidents such as checkout API errors, rollbacks, status page updates, API key exposure, rate limits, and export delays.
+Every request to `POST /api/ask` runs through the same pipeline:
 
-Engineers often ask questions like:
-
-> "What should I do if checkout API errors spike right after a release?"
-
-A general model might give generic advice, but your company needs answers grounded in approved runbooks. Your task is to complete a Flask endpoint that uses LangChain to organize this workflow:
-
-    question
-    -> retrieve approved runbook chunks
-    -> format retrieved context
-    -> fill a prompt template
-    -> call a local Ollama chat model
-    -> parse the answer
-    -> return answer + sources + LangChain debug metadata
-
-LangChain should organize the AI workflow. It should not replace your understanding of retrieval, prompt design, source attribution, fallback behavior, or API response structure.
-
-## What You Will Build
-
-You will complete a `POST /api/ask` endpoint.
-
-A successful response should use this general shape:
-
-```json
-    {
-      "answer": "Pause additional deployments, prepare a rollback, notify the incident channel, and monitor checkout metrics after mitigation.",
-      "sources": [
-        {
-          "source_id": "REL-101",
-          "title": "Checkout API Error Spike Runbook",
-          "category": "Reliability",
-          "section": "Mitigation",
-          "chunk_id": "chunk-rel-101-b",
-          "distance": 0.1234
-        }
-      ],
-      "langchain": {
-        "chain_expression": "ChatPromptTemplate | ChatOllama | StrOutputParser",
-        "components": {
-          "vector_store": "Chroma",
-          "retrieval_method": "similarity_search_with_score",
-          "prompt_template": "ChatPromptTemplate",
-          "chat_model": "ChatOllama",
-          "output_parser": "StrOutputParser"
-        },
-        "retrieved_count": 1,
-        "retrieved_chunk_ids": ["chunk-rel-101-b"],
-        "top_k": 3,
-        "context_characters": 850,
-        "fallback": false,
-        "score_type": "Chroma distance; lower usually means closer in this lesson setup"
-      }
-    }
+```
+question → validate → retrieve runbook chunks → (fallback if none) → format context → prompt | model | parser → answer + sources + debug metadata
 ```
 
-## Tools and Resources
+The model step is a LangChain chain:
 
-You will use:
+```
+ChatPromptTemplate | ChatOllama | StrOutputParser
+```
 
-- Python 3.10
-- pipenv
-- Flask
-- Pytest
-- LangChain
-- Chroma
-- Ollama
-- A local embedding model: `embeddinggemma`
-- A local generation model: `llama3.2`
+Each stage lives in its own module, so it can be tested and changed on its own:
 
-The automated tests use fake vector stores and fake chains where possible. The tests do not require a live Ollama model or a seeded Chroma database.
+| Module | Responsibility |
+| --- | --- |
+| `app.py` | Flask route: reads the request, validates it, delegates to the service, and maps results to HTTP status codes |
+| `lib/config.py` | Model names, Chroma path, collection name, `top_k`, and question length limits |
+| `lib/validation.py` | Rejects non-object, missing, non-string, blank, too-short, or too-long questions |
+| `lib/vector_store.py` | Builds `OllamaEmbeddings` and the `Chroma` store, and retrieves scored chunks with `similarity_search_with_score` |
+| `lib/prompt_templates.py` | Builds a `ChatPromptTemplate` that restricts the model to approved context |
+| `lib/langchain_rag_service.py` | Runs the workflow, builds the chain, handles fallback, and wraps failures in `LangChainServiceError` |
+| `lib/response_formatter.py` | Builds success, fallback, error, source, and debug metadata responses |
+
+## API
+
+### `POST /api/ask`
+
+**Request**
+
+```json
+{ "question": "When should we publish a status page update?" }
+```
+
+**Success (200)**: an answer grounded in the retrieved runbooks, source metadata for review, and LangChain debug info.
+
+```json
+{
+  "answer": "A status page update should be published when an incident affects customer-facing availability, payment completion, data exports, or login.",
+  "sources": [
+    {
+      "source_id": "REL-120",
+      "title": "Status Page Update Guide",
+      "category": "Reliability",
+      "section": "Customer Communication",
+      "chunk_id": "chunk-rel-120-a",
+      "distance": 0.6164
+    }
+  ],
+  "langchain": {
+    "chain_expression": "ChatPromptTemplate | ChatOllama | StrOutputParser",
+    "retrieved_count": 3,
+    "retrieved_chunk_ids": ["chunk-rel-120-a", "chunk-data-410-a", "chunk-rel-101-a"],
+    "top_k": 3,
+    "context_characters": 1250,
+    "fallback": false,
+    "score_type": "Chroma distance; lower usually means closer in this lesson setup"
+  }
+}
+```
+
+**Fallback (200)**: when no usable context is found, the chain is never invoked, and the API returns a safe message with no sources.
+
+```json
+{
+  "answer": "I do not have enough approved runbook context to answer that reliably.",
+  "sources": [],
+  "langchain": { "fallback": true, "retrieved_count": 0 }
+}
+```
+
+**Invalid input (400)**: one of `invalid_request`, `missing_question`, `invalid_question`, `empty_question`, `short_question`, or `long_question`.
+
+```json
+{ "error": "short_question", "message": "Question must be at least 3 characters." }
+```
+
+**Service failure (502)**: Chroma or Ollama failed, or the model returned an empty answer.
+
+```json
+{ "error": "langchain_service_error", "message": "LangChain RAG workflow failed: ..." }
+```
+
+## Design Decisions
+
+- **LangChain organizes, but doesn't replace, the RAG steps:** Retrieval, context formatting, fallback, and source attribution are still explicit code. LangChain handles the prompt → model → parser sequence and standardizes the vector store and model interfaces.
+- **Grounding:** The system prompt tells the model to answer only from approved retrieved context, not to invent policies, procedures, or incident steps, and to say when context is insufficient.
+- **Fallback before generation:** If retrieval returns no usable text, the service returns the fallback response without invoking the chain, so the model has no chance to guess.
+- **Source attribution without data exposure:** Sources include runbook IDs, sections, chunk IDs, and distances for review, but never the full chunk text.
+- **Inspectable debug metadata:** Each response reports the chain expression, components, retrieved chunk IDs, context size, and fallback status, which offsets how a chain can hide intermediate steps.
+- **One error type for the service:** Retrieval failures, model failures, and empty answers all become `LangChainServiceError`, so the route handles them with a single `except` and a 502.
+- **Dependency injection:** `answer_question()` and `retrieve_context()` accept optional fake vector stores and chains, so the full workflow is tested without Chroma or Ollama.
+- **Lazy imports:** LangChain, Chroma, and Ollama are imported inside the builder functions, so the tests run without loading those services.
+
+## Known Limitations
+
+Observed while running the pipeline locally:
+
+- `top_k` always returns results, even loosely related ones, so fallback rarely triggers with a seeded store. A distance threshold would let unrelated questions fall back safely.
+- The model doesn't always use every relevant chunk; in one run it answered from the Triage section and skipped the higher-ranked Mitigation section.
+- Answers sometimes reference internal labels like "Context 1." Prompting the model to cite Source IDs would make them clearer.
 
 ## Setup
 
-Install dependencies:
+Requires Python 3.10 and `pipenv`.
 
 ```bash
 pipenv install
 pipenv shell
 ```
 
-Run the tests:
+## Running The Tests
 
 ```bash
-pytest
+pytest -q
 ```
 
-At the start, many tests will fail. Use the failures as your checklist.
+All 33 tests pass. They use fake vector stores and chains, so they don't need Ollama, a seeded database, or internet access.
 
-## Optional Local RAG Check
+## Trying It Locally (optional)
 
-The autograded tests do not require a running Ollama instance, but you can try the full local workflow after you complete the lab.
+This requires [Ollama](https://ollama.com) installed and running.
 
-Install or start Ollama, then pull models:
+1. Download the embedding and chat models:
 
 ```bash
 ollama pull embeddinggemma
 ollama pull llama3.2
-ollama run llama3.2 "Hello"
 ```
 
-Seed the vector store:
+2. Load the runbooks into Chroma. This creates a local `chroma_db/` folder, which is git-ignored.
 
 ```bash
 python seed_chroma.py
 ```
 
-Run Flask:
-
-```bash
-flask --app app run --debug
-```
-
-Test the endpoint:
-
-```bash
-curl -i -X POST http://127.0.0.1:5000/api/ask -H "Content-Type: application/json" -d "{\"question\": \"What should I do if checkout API errors spike right after a release?\"}"
-```
-
-You can also test the service without Flask:
+3. Try the service directly, without Flask:
 
 ```bash
 python try_langchain_rag.py "When should we publish a status page update?"
 ```
 
-## Project Structure
-
-```text
-backend-langchain-rag-lab/
-├── app.py
-├── seed_chroma.py
-├── try_langchain_rag.py
-├── planning_notes.md
-├── Pipfile
-├── requirements.txt
-├── pytest.ini
-├── data/
-│   └── runbook_chunks.json
-├── lib/
-│   ├── __init__.py
-│   ├── config.py
-│   ├── documents.py
-│   ├── langchain_rag_service.py
-│   ├── prompt_templates.py
-│   ├── response_formatter.py
-│   ├── validation.py
-│   └── vector_store.py
-└── tests/
-    ├── fakes.py
-    ├── test_app.py
-    ├── test_langchain_rag_service.py
-    ├── test_prompt_templates.py
-    ├── test_response_formatter.py
-    ├── test_static_structure.py
-    ├── test_validation.py
-    └── test_vector_store.py
-```
-
-## Instructions
-
-### 1. Identify the system goal
-
-Complete `planning_notes.md`.
-
-Your notes should answer:
-
-- Who does the endpoint support?
-- What business or reliability problem does it solve?
-- Why should the model answer from approved runbook context?
-- What should a successful response include?
-- What should the system do when no approved context is available?
-
-### 2. Map the manual RAG workflow
-
-Before changing code, identify the manual RAG responsibilities this lab is organizing:
-
-- receive the question
-- retrieve context
-- build the prompt
-- call the model
-- parse or format output
-- return sources
-- verify quality
-
-This mapping matters because LangChain changes how the workflow is organized, not what the workflow is responsible for doing.
-
-### 3. Complete request validation
-
-In `lib/validation.py`, implement `validate_question_payload()`.
-
-The function should:
-
-- reject non-object JSON bodies,
-- require a `question` field,
-- require the question to be a string,
-- strip whitespace,
-- reject blank questions,
-- reject questions shorter than the minimum length,
-- reject overly long questions,
-- return `(question, None)` when valid,
-- return `(None, error_dict)` when invalid.
-
-### 4. Complete response formatting
-
-In `lib/response_formatter.py`, implement helpers that create predictable response shapes.
-
-Successful API responses must return:
-
-- `answer`
-- `sources`
-- `langchain`
-
-Error responses must return:
-
-- `error`
-- `message`
-
-Source objects should include metadata and distance. They should not include full document text.
-
-### 5. Complete the prompt template
-
-In `lib/prompt_templates.py`, implement `build_rag_prompt()` using `ChatPromptTemplate`.
-
-The prompt must include placeholders for:
-
-- `{context}`
-- `{question}`
-
-The prompt should instruct the model to answer only from approved retrieved context and avoid unsupported claims.
-
-### 6. Complete retrieval support
-
-In `lib/vector_store.py`, implement:
-
-- `build_embeddings()`
-- `build_vector_store()`
-- `retrieve_context()`
-
-`retrieve_context()` should use a provided fake vector store during tests or build the real Chroma vector store when one is not provided.
-
-### 7. Complete the LangChain RAG service
-
-In `lib/langchain_rag_service.py`, implement:
-
-- `build_chat_model()`
-- `build_chain()`
-- `has_usable_context()`
-- `format_context()`
-- `answer_question()`
-
-The chain should use this sequence:
-
-```python
-prompt_template | llm | StrOutputParser()
-```
-
-`answer_question()` should:
-
-- Strip the question.
-- Retrieve scored documents.
-- Return a safe fallback if no usable context exists.
-- Format retrieved context.
-- Invoke the chain with `context` and `question`.
-- Reject empty model output.
-- Format sources.
-- Return success JSON with LangChain debug metadata.
-- Wrap unexpected errors in `LangChainServiceError`.
-
-### 8. Complete the Flask route
-
-In `app.py`, complete `POST /api/ask`.
-
-The route should:
-
-- read JSON,
-- validate the question,
-- return validation errors with HTTP 400,
-- call `answer_question(question)`,
-- return successful responses with HTTP 200,
-- convert `LangChainServiceError` failures into structured HTTP 502 responses.
-
-The route should not build prompts, retrieve documents, or call the model directly.
-
-### 9. Verify the refactor
-
-Run:
+4. Start the API:
 
 ```bash
-pytest
+flask --app app run --debug
 ```
 
-Use the test failures as feedback. The tests check validation, response formatting, prompt variables, retrieval behavior, service flow, fallback behavior, error handling, and route behavior.
+5. In a second terminal, ask a question:
 
-## Submission Criteria
+```bash
+curl -i -X POST http://127.0.0.1:5000/api/ask \
+  -H "Content-Type: application/json" \
+  -d '{"question": "What should I do if checkout API errors spike right after a release?"}'
+```
 
-Submit your completed project files.
+## Technology Used
 
-Your work is complete when:
-
-- all tests pass,
-- `planning_notes.md` is complete,
-- the Flask route delegates the AI workflow to the service layer,
-- the LangChain workflow preserves RAG behavior,
-- the API response includes answer, sources, and LangChain debug metadata.
-
-## Grading Criteria
-
-Your grade is based on the automated tests used in CodeGrade.
-
-The tests measure:
-
-- request validation
-- stable API response shape
-- source metadata formatting
-- prompt template structure
-- retriever use
-- LangChain chain structure
-- fallback behavior
-- error handling
-- separation between Flask route logic and AI workflow logic
-
-## Reflection
-
-After your tests pass, review your planning notes and code.
-
-Ask yourself:
-
-- What did LangChain make easier to organize?
-- What parts still require careful debugging?
-- How does the endpoint show that the answer is source-backed?
-- How does fallback behavior reduce hallucination risk?
-- How would this workflow support another assistant with a different document collection?
+Python 3.10 · Flask · LangChain · Chroma · Ollama (llama3.2, embeddinggemma) · pytest
