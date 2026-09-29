@@ -26,7 +26,9 @@ def build_rag_prompt():
             (
                 "human",
                 "Approved runbook context:\n{context}\n\n"
-                "Question: {question}",
+                "Question: {question}\n\n"
+                "Combine guidance from all relevant contexts, and cite sources "
+                "by their Source ID (for example, REL-101), not by context number.",
             ),
         ]
     )
